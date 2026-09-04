@@ -69,6 +69,7 @@ def log_validation(vae, args, accelerator, weight_dtype, step, is_final_validati
         vae = accelerator.unwrap_model(vae)
     else:
         vae = AutoencoderKL.from_pretrained(args.output_dir, torch_dtype=weight_dtype)
+        vae.to(accelerator.device)
 
     images = []
     inference_ctx = contextlib.nullcontext() if is_final_validation else torch.autocast("cuda")
@@ -90,7 +91,13 @@ def log_validation(vae, args, accelerator, weight_dtype, step, is_final_validati
         with inference_ctx:
             reconstructions = vae(targets).sample
 
-        images.append(torch.cat([targets.cpu(), reconstructions.cpu()], axis=0))
+        images.append(
+            torch.cat([targets.cpu(), reconstructions.cpu()], axis=0)
+            .float()
+            .clamp(-1, 1)
+            .add(1)
+            .div(2)
+        )
 
     tracker_key = "test" if is_final_validation else "validation"
     for tracker in accelerator.trackers:
@@ -101,7 +108,10 @@ def log_validation(vae, args, accelerator, weight_dtype, step, is_final_validati
             tracker.log(
                 {
                     f"{tracker_key}: Original (left), Reconstruction (right)": [
-                        wandb.Image(torchvision.utils.make_grid(image)) for _, image in enumerate(images)
+                        wandb.Image(
+                            (torchvision.utils.make_grid(image).clamp(0, 1) * 255).byte()
+                        )
+                        for _, image in enumerate(images)
                     ]
                 }
             )
@@ -627,6 +637,7 @@ def main(args):
     if args.use_ema:
         ema_vae = EMAModel(vae.parameters(), model_cls=AutoencoderKL, model_config=vae.config)
     perceptual_loss = lpips.LPIPS(net="vgg").eval()
+    perceptual_loss.requires_grad_(False)
     discriminator = NLayerDiscriminator(input_nc=3, n_layers=3, use_actnorm=False).apply(weights_init)
     discriminator = torch.nn.SyncBatchNorm.convert_sync_batchnorm(discriminator)
 
@@ -672,11 +683,10 @@ def main(args):
 
                 # pop models so that they are not loaded again
                 model = models.pop()
-                load_model = NLayerDiscriminator(input_nc=3, n_layers=3, use_actnorm=False).load_state_dict(
-                    os.path.join(input_dir, "discriminator", "pytorch_model.bin")
+                discriminator_state_dict = torch.load(
+                    os.path.join(input_dir, "discriminator", "pytorch_model.bin"), map_location="cpu"
                 )
-                model.load_state_dict(load_model.state_dict())
-                del load_model
+                model.load_state_dict(discriminator_state_dict)
 
                 model = models.pop()
                 load_model = AutoencoderKL.from_pretrained(input_dir, subfolder="autoencoderkl")
@@ -816,9 +826,9 @@ def main(args):
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    # Move VAE, perceptual loss and discriminator to device and cast to weight_dtype
+    # Keep LPIPS in float32 so its feature distance and input gradients are not quantized by AMP.
     vae.to(accelerator.device, dtype=weight_dtype)
-    perceptual_loss.to(accelerator.device, dtype=weight_dtype)
+    perceptual_loss.to(accelerator.device, dtype=torch.float32)
     discriminator.to(accelerator.device, dtype=weight_dtype)
     if args.use_ema:
         ema_vae.to(accelerator.device, dtype=weight_dtype)
@@ -900,16 +910,15 @@ def main(args):
                 with accelerator.accumulate(vae):
                     # reconstruction loss. Pixel level differences between input vs output
                     if args.rec_loss == "l2":
-                        rec_loss = F.mse_loss(reconstructions.float(), targets.float(), reduction="none")
+                        pixel_loss = F.mse_loss(reconstructions.float(), targets.float(), reduction="none")
                     elif args.rec_loss == "l1":
-                        rec_loss = F.l1_loss(reconstructions.float(), targets.float(), reduction="none")
+                        pixel_loss = F.l1_loss(reconstructions.float(), targets.float(), reduction="none")
                     else:
                         raise ValueError(f"Invalid reconstruction loss type: {args.rec_loss}")
                     # perceptual loss. The high level feature mean squared error loss
-                    with torch.no_grad():
-                        p_loss = perceptual_loss(reconstructions, targets)
+                    p_loss = perceptual_loss(reconstructions.float(), targets.float())
 
-                    rec_loss = rec_loss + args.perceptual_scale * p_loss
+                    rec_loss = pixel_loss + args.perceptual_scale * p_loss
                     nll_loss = rec_loss
                     nll_loss = torch.sum(nll_loss) / nll_loss.shape[0]
 
@@ -932,6 +941,7 @@ def main(args):
                         "loss": loss.detach().mean().item(),
                         "nll_loss": nll_loss.detach().mean().item(),
                         "rec_loss": rec_loss.detach().mean().item(),
+                        "pixel_loss": pixel_loss.detach().mean().item(),
                         "p_loss": p_loss.detach().mean().item(),
                         "kl_loss": kl_loss.detach().mean().item(),
                         "disc_weight": disc_weight.detach().mean().item(),
