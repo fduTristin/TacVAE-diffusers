@@ -447,6 +447,12 @@ def parse_args(input_args=None):
         help="Scaling factor for the Kullback-Leibler divergence penalty term.",
     )
     parser.add_argument(
+        "--kl_warmup_steps",
+        type=int,
+        default=0,
+        help="Linearly warm the KL scale from zero to --kl_scale over this many optimization steps.",
+    )
+    parser.add_argument(
         "--perceptual_scale",
         type=float,
         default=0.5,
@@ -497,6 +503,8 @@ def parse_args(input_args=None):
         raise ValueError(
             "`--resolution` must be divisible by 8 for consistently sized encoded images between the VAE and the diffusion model."
         )
+    if args.kl_scale < 0 or args.kl_warmup_steps < 0:
+        raise ValueError("`--kl_scale` and `--kl_warmup_steps` must be non-negative")
 
     return args
 
@@ -924,6 +932,11 @@ def main(args):
 
                     kl_loss = posterior.kl()
                     kl_loss = torch.sum(kl_loss) / kl_loss.shape[0]
+                    if args.kl_warmup_steps:
+                        kl_scale = args.kl_scale * min(1.0, global_step / args.kl_warmup_steps)
+                    else:
+                        kl_scale = args.kl_scale
+                    weighted_kl_loss = kl_scale * kl_loss
 
                     logits_fake = discriminator(reconstructions)
                     g_loss = -torch.mean(logits_fake)
@@ -935,7 +948,7 @@ def main(args):
                     disc_weight = disc_weight * args.disc_scale
                     disc_factor = args.disc_factor if global_step >= args.disc_start else 0.0
 
-                    loss = nll_loss + args.kl_scale * kl_loss + disc_weight * disc_factor * g_loss
+                    loss = nll_loss + weighted_kl_loss + disc_weight * disc_factor * g_loss
 
                     logs = {
                         "loss": loss.detach().mean().item(),
@@ -944,6 +957,25 @@ def main(args):
                         "pixel_loss": pixel_loss.detach().mean().item(),
                         "p_loss": p_loss.detach().mean().item(),
                         "kl_loss": kl_loss.detach().mean().item(),
+                        "kl_per_latent": kl_loss.detach().mean().item() / posterior.mean[0].numel(),
+                        "kl_scale": kl_scale,
+                        "weighted_kl_loss": weighted_kl_loss.detach().mean().item(),
+                        "latent_mean": latents.float().mean().item(),
+                        "latent_std": latents.float().std(unbiased=False).item(),
+                        "scaled_latent_mean": (
+                            latents.float()
+                            * accelerator.unwrap_model(vae).config.scaling_factor
+                        )
+                        .mean()
+                        .item(),
+                        "scaled_latent_std": (
+                            latents.float()
+                            * accelerator.unwrap_model(vae).config.scaling_factor
+                        )
+                        .std(unbiased=False)
+                        .item(),
+                        "posterior_mean_abs": posterior.mean.float().abs().mean().item(),
+                        "posterior_std": posterior.std.float().mean().item(),
                         "disc_weight": disc_weight.detach().mean().item(),
                         "disc_factor": disc_factor,
                         "g_loss": g_loss.detach().mean().item(),
