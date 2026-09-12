@@ -61,6 +61,29 @@ check_min_version("0.33.0.dev0")
 logger = get_logger(__name__)
 
 
+def preprocess_tactile_image(image, width, height):
+    """Use the exported rectangle unchanged; reject stale square datasets."""
+    image = image.convert('RGB')
+    if image.size != (width, height):
+        raise ValueError(f'Expected exported image {(width, height)}, got {image.size}. Use the completed rectangular dataset.')
+    return transforms.functional.to_tensor(image).sub(0.5).div(0.5)
+
+
+class TrainingAutoencoderKL(AutoencoderKL):
+    """Keep encode/decode inside the prepared model's DDP forward."""
+
+    def forward(self, sample, training_outputs=False, **kwargs):
+        if not training_outputs:
+            return super().forward(sample, **kwargs)
+        posterior = self.encode(sample).latent_dist
+        # Sampling and KL inputs retain FP32 numerical resolution under AMP.
+        mean = posterior.mean.float()
+        logvar = posterior.logvar.float()
+        latents = mean + torch.exp(0.5 * logvar) * torch.randn_like(mean)
+        reconstruction = self.decode(latents).sample
+        return reconstruction, mean, logvar, latents
+
+
 @torch.no_grad()
 def log_validation(vae, args, accelerator, weight_dtype, step, is_final_validation=False):
     logger.info("Running validation... ")
@@ -72,24 +95,24 @@ def log_validation(vae, args, accelerator, weight_dtype, step, is_final_validati
         vae.to(accelerator.device)
 
     images = []
-    inference_ctx = contextlib.nullcontext() if is_final_validation else torch.autocast("cuda")
+    validation_mse = []
+    validation_roi_mse = []
 
-    image_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
+    def image_transforms(image):
+        return preprocess_tactile_image(image, args.image_width, args.image_height)
 
     for i, validation_image in enumerate(args.validation_image):
         validation_image = Image.open(validation_image).convert("RGB")
         targets = image_transforms(validation_image).to(accelerator.device, weight_dtype)
         targets = targets.unsqueeze(0)
 
-        with inference_ctx:
+        with accelerator.autocast():
             reconstructions = vae(targets).sample
+
+        squared_error = (reconstructions.float() - targets.float()).square()
+        validation_mse.append(squared_error.mean().item())
+        # No artificial padding is present in the rectangular dataset.
+        validation_roi_mse.append(squared_error.mean().item())
 
         images.append(
             torch.cat([targets.cpu(), reconstructions.cpu()], axis=0)
@@ -100,6 +123,10 @@ def log_validation(vae, args, accelerator, weight_dtype, step, is_final_validati
         )
 
     tracker_key = "test" if is_final_validation else "validation"
+    accelerator.log({
+        f"{tracker_key}/mse": float(np.mean(validation_mse)),
+        f"{tracker_key}/nonpadding_mse": float(np.mean(validation_roi_mse)),
+    }, step=step)
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
@@ -397,6 +424,12 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
+        '--train_index_file',
+        type=str,
+        default=None,
+        help='Optional newline-delimited image-name index relative to train_data_dir.',
+    )
+    parser.add_argument(
         "--image_column", type=str, default="image", help="The column of the dataset containing the target image."
     )
     parser.add_argument(
@@ -444,7 +477,7 @@ def parse_args(input_args=None):
         "--kl_scale",
         type=float,
         default=1e-6,
-        help="Scaling factor for the Kullback-Leibler divergence penalty term.",
+        help="Weight for the FP32 mean KL divergence per latent element.",
     )
     parser.add_argument(
         "--kl_warmup_steps",
@@ -488,6 +521,8 @@ def parse_args(input_args=None):
         help="Only train the VAE decoder.",
     )
 
+    parser.add_argument('--image_width', type=int, default=256)
+    parser.add_argument('--image_height', type=int, default=144)
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
@@ -499,9 +534,9 @@ def parse_args(input_args=None):
     if args.dataset_name is None and args.train_data_dir is None:
         raise ValueError("Specify either `--dataset_name` or `--train_data_dir`")
 
-    if args.resolution % 8 != 0:
+    if args.image_width <= 0 or args.image_height <= 0 or args.image_width % 8 != 0 or args.image_height % 8 != 0:
         raise ValueError(
-            "`--resolution` must be divisible by 8 for consistently sized encoded images between the VAE and the diffusion model."
+            "image_width and image_height must be positive and divisible by 8."
         )
     if args.kl_scale < 0 or args.kl_warmup_steps < 0:
         raise ValueError("`--kl_scale` and `--kl_warmup_steps` must be non-negative")
@@ -510,6 +545,31 @@ def parse_args(input_args=None):
 
 
 def make_train_dataset(args, accelerator):
+    if args.train_index_file is not None:
+        class IndexedTactileDataset(torch.utils.data.Dataset):
+            def __init__(self, train_dir, index_file):
+                self.train_dir = Path(train_dir).resolve()
+                self.paths = [line.strip() for line in Path(index_file).read_text().splitlines() if line.strip()]
+                if not self.paths:
+                    raise ValueError(f'Training index is empty: {index_file}')
+                for name in self.paths:
+                    if Path(name).name != name or not name.lower().endswith(('.jpg', '.jpeg', '.png')):
+                        raise ValueError(f'Invalid indexed image name: {name}')
+                if args.max_train_samples is not None:
+                    self.paths = self.paths[:args.max_train_samples]
+
+            def __len__(self):
+                return len(self.paths)
+
+            def __getitem__(self, index):
+                with Image.open(self.train_dir / self.paths[index]) as image:
+                    pixel_values = preprocess_tactile_image(image, args.image_width, args.image_height)
+                return {'pixel_values': pixel_values}
+
+        train_dataset = IndexedTactileDataset(args.train_data_dir, args.train_index_file)
+        logger.info(f'Using indexed tactile dataset with {len(train_dataset)} images: {args.train_index_file}')
+        return train_dataset
+
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
 
@@ -550,14 +610,8 @@ def make_train_dataset(args, accelerator):
                 f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
             )
 
-    image_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
+    def image_transforms(image):
+        return preprocess_tactile_image(image, args.image_width, args.image_height)
 
     def preprocess_train(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
@@ -584,6 +638,14 @@ def collate_fn(examples):
 
 
 def main(args):
+    if args.pretrained_model_name_or_path is not None:
+        raise ValueError("This tactile trainer trains from scratch; supply model_config_name_or_path instead of pretrained weights.")
+    if args.model_config_name_or_path is None:
+        raise ValueError("Supply a local architecture JSON using model_config_name_or_path.")
+    if args.max_train_steps is None:
+        raise ValueError("Set an explicit max_train_steps for the tactile trainer.")
+    if args.disc_start < args.max_train_steps:
+        raise ValueError("The tactile trainer supports reconstruction + KL only; disable GAN with disc_start >= max_train_steps.")
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
             "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
@@ -636,16 +698,18 @@ def main(args):
     # Load AutoencoderKL
     if args.pretrained_model_name_or_path is None and args.model_config_name_or_path is None:
         config = AutoencoderKL.load_config("stabilityai/sd-vae-ft-mse")
-        vae = AutoencoderKL.from_config(config)
+        vae = TrainingAutoencoderKL.from_config(config)
     elif args.pretrained_model_name_or_path is not None:
-        vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, revision=args.revision)
+        vae = TrainingAutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, revision=args.revision)
     else:
         config = AutoencoderKL.load_config(args.model_config_name_or_path)
-        vae = AutoencoderKL.from_config(config)
+        vae = TrainingAutoencoderKL.from_config(config)
     if args.use_ema:
         ema_vae = EMAModel(vae.parameters(), model_cls=AutoencoderKL, model_config=vae.config)
-    perceptual_loss = lpips.LPIPS(net="vgg").eval()
-    perceptual_loss.requires_grad_(False)
+    perceptual_loss = None
+    if args.perceptual_scale > 0:
+        perceptual_loss = lpips.LPIPS(net="vgg").eval()
+        perceptual_loss.requires_grad_(False)
     discriminator = NLayerDiscriminator(input_nc=3, n_layers=3, use_actnorm=False).apply(weights_init)
     discriminator = torch.nn.SyncBatchNorm.convert_sync_batchnorm(discriminator)
 
@@ -826,17 +890,13 @@ def main(args):
         vae, discriminator, optimizer, disc_optimizer, train_dataloader, lr_scheduler, disc_lr_scheduler
     )
 
-    # For mixed precision training we cast the text_encoder and vae weights to half-precision
-    # as these models are only used for inference, keeping weights in full precision is not required.
+    # AMP controls compute precision; trainable parameters and Adam states stay FP32.
     weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
 
     # Keep LPIPS in float32 so its feature distance and input gradients are not quantized by AMP.
     vae.to(accelerator.device, dtype=weight_dtype)
-    perceptual_loss.to(accelerator.device, dtype=torch.float32)
+    if perceptual_loss is not None:
+        perceptual_loss.to(accelerator.device, dtype=torch.float32)
     discriminator.to(accelerator.device, dtype=weight_dtype)
     if args.use_ema:
         ema_vae.to(accelerator.device, dtype=weight_dtype)
@@ -909,13 +969,14 @@ def main(args):
         discriminator.train()
         for step, batch in enumerate(train_dataloader):
             # Convert images to latent space and reconstruct from them
-            targets = batch["pixel_values"].to(dtype=weight_dtype)
-            posterior = accelerator.unwrap_model(vae).encode(targets).latent_dist
-            latents = posterior.sample()
-            reconstructions = accelerator.unwrap_model(vae).decode(latents).sample
+            targets = batch["pixel_values"].to(dtype=torch.float32)
 
             if (step // args.gradient_accumulation_steps) % 2 == 0 or global_step < args.disc_start:
                 with accelerator.accumulate(vae):
+                    with accelerator.autocast():
+                        reconstructions, posterior_mean, posterior_logvar, latents = vae(
+                            targets, training_outputs=True
+                        )
                     # reconstruction loss. Pixel level differences between input vs output
                     if args.rec_loss == "l2":
                         pixel_loss = F.mse_loss(reconstructions.float(), targets.float(), reduction="none")
@@ -923,29 +984,34 @@ def main(args):
                         pixel_loss = F.l1_loss(reconstructions.float(), targets.float(), reduction="none")
                     else:
                         raise ValueError(f"Invalid reconstruction loss type: {args.rec_loss}")
+                    # Rectangular exports contain no artificial padding: train on every pixel.
                     # perceptual loss. The high level feature mean squared error loss
-                    p_loss = perceptual_loss(reconstructions.float(), targets.float())
+                    p_loss = (
+                        perceptual_loss(reconstructions.float(), targets.float())
+                        if perceptual_loss is not None else pixel_loss.new_zeros(())
+                    )
 
                     rec_loss = pixel_loss + args.perceptual_scale * p_loss
                     nll_loss = rec_loss
-                    nll_loss = torch.sum(nll_loss) / nll_loss.shape[0]
+                    nll_loss = nll_loss.mean()
 
-                    kl_loss = posterior.kl()
-                    kl_loss = torch.sum(kl_loss) / kl_loss.shape[0]
+                    # Compute KL in FP32 and average over latent elements. Summing a BF16 KL tensor makes the
+                    # metric jump in coarse steps, while a per-latent mean gives the scale a stable interpretation.
+                    posterior_var = torch.exp(posterior_logvar)
+                    kl_element = 0.5 * (
+                        posterior_mean.pow(2) + posterior_var - 1.0 - posterior_logvar
+                    )
+                    kl_loss = kl_element.mean()
+                    kl_sum = kl_element.flatten(1).sum(1).mean()
                     if args.kl_warmup_steps:
                         kl_scale = args.kl_scale * min(1.0, global_step / args.kl_warmup_steps)
                     else:
                         kl_scale = args.kl_scale
                     weighted_kl_loss = kl_scale * kl_loss
 
-                    logits_fake = discriminator(reconstructions)
-                    g_loss = -torch.mean(logits_fake)
-                    last_layer = accelerator.unwrap_model(vae).decoder.conv_out.weight
-                    nll_grads = torch.autograd.grad(nll_loss, last_layer, retain_graph=True)[0]
-                    g_grads = torch.autograd.grad(g_loss, last_layer, retain_graph=True)[0]
-                    disc_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
-                    disc_weight = torch.clamp(disc_weight, 0.0, 1e4).detach()
-                    disc_weight = disc_weight * args.disc_scale
+                    # This diagnostic trainer intentionally excludes adversarial training.
+                    g_loss = nll_loss.new_zeros(())
+                    disc_weight = nll_loss.new_zeros(())
                     disc_factor = args.disc_factor if global_step >= args.disc_start else 0.0
 
                     loss = nll_loss + weighted_kl_loss + disc_weight * disc_factor * g_loss
@@ -957,7 +1023,8 @@ def main(args):
                         "pixel_loss": pixel_loss.detach().mean().item(),
                         "p_loss": p_loss.detach().mean().item(),
                         "kl_loss": kl_loss.detach().mean().item(),
-                        "kl_per_latent": kl_loss.detach().mean().item() / posterior.mean[0].numel(),
+                        "kl_sum": kl_sum.detach().item(),
+                        "kl_per_latent": kl_loss.detach().item(),
                         "kl_scale": kl_scale,
                         "weighted_kl_loss": weighted_kl_loss.detach().mean().item(),
                         "latent_mean": latents.float().mean().item(),
@@ -974,8 +1041,8 @@ def main(args):
                         )
                         .std(unbiased=False)
                         .item(),
-                        "posterior_mean_abs": posterior.mean.float().abs().mean().item(),
-                        "posterior_std": posterior.std.float().mean().item(),
+                        "posterior_mean_abs": posterior_mean.abs().mean().item(),
+                        "posterior_std": torch.exp(0.5 * posterior_logvar).mean().item(),
                         "disc_weight": disc_weight.detach().mean().item(),
                         "disc_factor": disc_factor,
                         "g_loss": g_loss.detach().mean().item(),
@@ -985,7 +1052,8 @@ def main(args):
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
                         params_to_clip = vae.parameters()
-                        accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                        grad_norm = accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                        logs["grad_norm"] = grad_norm.item()
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=args.set_grads_to_none)
