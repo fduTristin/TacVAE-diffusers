@@ -50,6 +50,7 @@ from diffusers.utils import check_min_version, is_wandb_available, make_image_gr
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
+from indexed_tactile_dataset import read_indexed_image_paths
 
 
 if is_wandb_available():
@@ -427,7 +428,7 @@ def parse_args(input_args=None):
         '--train_index_file',
         type=str,
         default=None,
-        help='Optional newline-delimited image-name index relative to train_data_dir.',
+        help='Optional newline-delimited image-path index relative to train_data_dir.',
     )
     parser.add_argument(
         "--image_column", type=str, default="image", help="The column of the dataset containing the target image."
@@ -549,14 +550,7 @@ def make_train_dataset(args, accelerator):
         class IndexedTactileDataset(torch.utils.data.Dataset):
             def __init__(self, train_dir, index_file):
                 self.train_dir = Path(train_dir).resolve()
-                self.paths = [line.strip() for line in Path(index_file).read_text().splitlines() if line.strip()]
-                if not self.paths:
-                    raise ValueError(f'Training index is empty: {index_file}')
-                for name in self.paths:
-                    if Path(name).name != name or not name.lower().endswith(('.jpg', '.jpeg', '.png')):
-                        raise ValueError(f'Invalid indexed image name: {name}')
-                if args.max_train_samples is not None:
-                    self.paths = self.paths[:args.max_train_samples]
+                self.paths = read_indexed_image_paths(index_file, args.max_train_samples)
 
             def __len__(self):
                 return len(self.paths)
